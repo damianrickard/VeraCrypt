@@ -13,6 +13,8 @@
 #include <fstream>
 #include <stdio.h>
 #include <unistd.h>
+#include <vector>
+#include <CoreFoundation/CoreFoundation.h>
 #include <sys/param.h>
 #include <sys/ucred.h>
 #include <sys/mount.h>
@@ -30,73 +32,66 @@
 
 namespace VeraCrypt
 {
-	static string DecodePlistXmlString (const string &xmlString)
+	// RAII wrapper so CFRelease is never forgotten on early returns / exceptions.
+	class CFHolder
 	{
-		string decoded;
+	public:
+		explicit CFHolder (CFTypeRef ref = nullptr) : Ref (ref) { }
+		~CFHolder () { if (Ref) CFRelease (Ref); }
+		CFTypeRef Get () const { return Ref; }
+	private:
+		CFHolder (const CFHolder &);
+		CFHolder &operator= (const CFHolder &);
+		CFTypeRef Ref;
+	};
 
-		for (size_t i = 0; i < xmlString.size(); ++i)
-		{
-			if (xmlString[i] != '&')
-			{
-				decoded += xmlString[i];
-				continue;
-			}
+	static string CFStringToStdString (CFStringRef cfStr)
+	{
+		if (!cfStr)
+			return string();
 
-			if (xmlString.compare (i, 5, "&amp;") == 0)
-			{
-				decoded += '&';
-				i += 4;
-			}
-			else if (xmlString.compare (i, 4, "&lt;") == 0)
-			{
-				decoded += '<';
-				i += 3;
-			}
-			else if (xmlString.compare (i, 4, "&gt;") == 0)
-			{
-				decoded += '>';
-				i += 3;
-			}
-			else if (xmlString.compare (i, 6, "&quot;") == 0)
-			{
-				decoded += '"';
-				i += 5;
-			}
-			else if (xmlString.compare (i, 6, "&apos;") == 0)
-			{
-				decoded += '\'';
-				i += 5;
-			}
-			else
-				decoded += xmlString[i];
-		}
+		CFIndex length = CFStringGetLength (cfStr);
+		CFIndex maxSize = CFStringGetMaximumSizeForEncoding (length, kCFStringEncodingUTF8) + 1;
+		if (maxSize <= 0)
+			return string();
 
-		return decoded;
+		vector <char> buffer ((size_t) maxSize);
+		if (!CFStringGetCString (cfStr, &buffer[0], maxSize, kCFStringEncodingUTF8))
+			return string();
+
+		return string (&buffer[0]);
 	}
 
-	static bool ExtractPlistString (const string &xml, const string &key, size_t start, size_t limit, string &value, size_t *endPos = nullptr)
+	// Fetch a string value from a CFDictionary by (C-string) key; empty if absent
+	// or not a string.
+	static string CFDictionaryGetStdString (CFDictionaryRef dict, const char *key)
 	{
-		// hdiutil currently emits simple <key>name</key><string>value</string> pairs.
-		// This lightweight parser assumes the value follows the requested key.
-		string keyTag = "<key>" + key + "</key>";
-		size_t p = xml.find (keyTag, start);
-		if (p == string::npos || p >= limit)
-			return false;
+		if (!dict)
+			return string();
 
-		p = xml.find ("<string>", p + keyTag.size());
-		if (p == string::npos || p >= limit)
-			return false;
-		p += 8;
+		CFHolder cfKey (CFStringCreateWithCString (kCFAllocatorDefault, key, kCFStringEncodingUTF8));
+		if (!cfKey.Get())
+			return string();
 
-		size_t e = xml.find ("</string>", p);
-		if (e == string::npos || e > limit)
-			return false;
+		CFTypeRef value = CFDictionaryGetValue (dict, cfKey.Get());	// borrowed reference
+		if (!value || CFGetTypeID (value) != CFStringGetTypeID())
+			return string();
 
-		value = DecodePlistXmlString (xml.substr (p, e - p));
-		if (endPos)
-			*endPos = e + 9;
+		return CFStringToStdString ((CFStringRef) value);
+	}
 
-		return true;
+	// Parse an hdiutil -plist (XML) document into a CFPropertyList. Returns nullptr
+	// on failure; the caller owns the result and must CFRelease it.
+	static CFPropertyListRef ParsePropertyList (const string &xml)
+	{
+		if (xml.empty())
+			return nullptr;
+
+		CFHolder data (CFDataCreate (kCFAllocatorDefault, (const UInt8 *) xml.data(), (CFIndex) xml.size()));
+		if (!data.Get())
+			return nullptr;
+
+		return CFPropertyListCreateWithData (kCFAllocatorDefault, (CFDataRef) data.Get(), kCFPropertyListImmutable, nullptr, nullptr);
 	}
 
 	static string NormalizeDiskImagePath (const string &path)
@@ -125,45 +120,40 @@ namespace VeraCrypt
 		return normalized;
 	}
 
-	static bool ExtractDiskImageDeviceAndMountPoint (const string &xml, size_t start, size_t limit, DevicePath &device, DirectoryPath &mountPoint)
+	// Walk a "system-entities" array (from hdiutil attach/info). Prefer the entity
+	// that carries a mount-point; otherwise fall back to the first dev-entry.
+	static bool ExtractDeviceAndMountPointFromEntities (CFArrayRef entities, DevicePath &device, DirectoryPath &mountPoint)
 	{
+		if (!entities || CFGetTypeID (entities) != CFArrayGetTypeID())
+			return false;
+
 		string firstDevice;
 		string mountedDevice;
 		string mountedPath;
 
-		for (size_t p = start; ; )
+		CFIndex count = CFArrayGetCount (entities);
+		for (CFIndex i = 0; i < count; ++i)
 		{
-			size_t devKeyPos = xml.find ("<key>dev-entry</key>", p);
-			if (devKeyPos == string::npos || devKeyPos >= limit)
-				break;
-
-			string devEntry;
-			size_t devValueEnd = 0;
-			if (!ExtractPlistString (xml, "dev-entry", devKeyPos, limit, devEntry, &devValueEnd))
-			{
-				p = devKeyPos + 1;
+			CFTypeRef entry = CFArrayGetValueAtIndex (entities, i);	// borrowed reference
+			if (!entry || CFGetTypeID (entry) != CFDictionaryGetTypeID())
 				continue;
-			}
 
-			devEntry = StringConverter::Trim (devEntry);
+			CFDictionaryRef entryDict = (CFDictionaryRef) entry;
+
+			string devEntry = StringConverter::Trim (CFDictionaryGetStdString (entryDict, "dev-entry"));
+			if (devEntry.empty())
+				continue;
+
 			if (firstDevice.empty())
 				firstDevice = devEntry;
 
-			size_t nextDevKeyPos = xml.find ("<key>dev-entry</key>", devValueEnd);
-			if (nextDevKeyPos == string::npos || nextDevKeyPos > limit)
-				nextDevKeyPos = limit;
-
-			string currentMountPoint;
-			// hdiutil currently emits dev-entry before mount-point inside each entity.
-			if (ExtractPlistString (xml, "mount-point", devValueEnd, nextDevKeyPos, currentMountPoint)
-				&& !currentMountPoint.empty())
+			string currentMountPoint = CFDictionaryGetStdString (entryDict, "mount-point");
+			if (!currentMountPoint.empty())
 			{
 				mountedDevice = devEntry;
 				mountedPath = currentMountPoint;
 				break;
 			}
-
-			p = devValueEnd;
 		}
 
 		if (!mountedDevice.empty())
@@ -182,6 +172,20 @@ namespace VeraCrypt
 		return false;
 	}
 
+	// Parse "hdiutil attach -plist" output (top-level dict with "system-entities").
+	static bool ExtractDiskImageDeviceAndMountPoint (const string &attachXml, DevicePath &device, DirectoryPath &mountPoint)
+	{
+		CFHolder plist (ParsePropertyList (attachXml));
+		if (!plist.Get() || CFGetTypeID (plist.Get()) != CFDictionaryGetTypeID())
+			return false;
+
+		CFTypeRef entities = CFDictionaryGetValue ((CFDictionaryRef) plist.Get(), CFSTR ("system-entities"));	// borrowed
+		if (!entities || CFGetTypeID (entities) != CFArrayGetTypeID())
+			return false;
+
+		return ExtractDeviceAndMountPointFromEntities ((CFArrayRef) entities, device, mountPoint);
+	}
+
 	static bool FindDiskImageInfoByImagePath (const string &imagePath, DevicePath &device, DirectoryPath &mountPoint)
 	{
 		list <string> args;
@@ -191,27 +195,35 @@ namespace VeraCrypt
 		string xml = Process::Execute ("/usr/bin/hdiutil", args);
 		string normalizedImagePath = NormalizeDiskImagePath (imagePath);
 
-		for (size_t p = 0; ; )
+		CFHolder plist (ParsePropertyList (xml));
+		if (!plist.Get() || CFGetTypeID (plist.Get()) != CFDictionaryGetTypeID())
+			return false;
+
+		CFTypeRef images = CFDictionaryGetValue ((CFDictionaryRef) plist.Get(), CFSTR ("images"));	// borrowed
+		if (!images || CFGetTypeID (images) != CFArrayGetTypeID())
+			return false;
+
+		CFArrayRef imageArray = (CFArrayRef) images;
+		CFIndex count = CFArrayGetCount (imageArray);
+		for (CFIndex i = 0; i < count; ++i)
 		{
-			size_t imageKeyPos = xml.find ("<key>image-path</key>", p);
-			if (imageKeyPos == string::npos)
-				break;
-
-			string currentImagePath;
-			size_t imageValueEnd = 0;
-			if (!ExtractPlistString (xml, "image-path", imageKeyPos, string::npos, currentImagePath, &imageValueEnd))
-			{
-				p = imageKeyPos + 1;
+			CFTypeRef image = CFArrayGetValueAtIndex (imageArray, i);	// borrowed
+			if (!image || CFGetTypeID (image) != CFDictionaryGetTypeID())
 				continue;
-			}
 
-			size_t nextImageKeyPos = xml.find ("<key>image-path</key>", imageValueEnd);
-			if (NormalizeDiskImagePath (currentImagePath) == normalizedImagePath)
-			{
-				return ExtractDiskImageDeviceAndMountPoint (xml, imageValueEnd, nextImageKeyPos, device, mountPoint);
-			}
+			CFDictionaryRef imageDict = (CFDictionaryRef) image;
 
-			p = imageValueEnd;
+			string currentImagePath = CFDictionaryGetStdString (imageDict, "image-path");
+			if (NormalizeDiskImagePath (currentImagePath) != normalizedImagePath)
+				continue;
+
+			// Matching image found: extract from its system-entities (mirrors the
+			// previous behavior of returning the result for the first match).
+			CFTypeRef entities = CFDictionaryGetValue (imageDict, CFSTR ("system-entities"));	// borrowed
+			if (!entities || CFGetTypeID (entities) != CFArrayGetTypeID())
+				return false;
+
+			return ExtractDeviceAndMountPointFromEntities ((CFArrayRef) entities, device, mountPoint);
 		}
 
 		return false;
@@ -370,8 +382,86 @@ namespace VeraCrypt
 		}
 	}
 
+	// Strict /dev/diskN or /dev/rdiskN (optionally sN) device-node check so a value
+	// can be embedded safely in a generated shell command.
+	static bool IsPlainDiskDevicePath (const string &path)
+	{
+		size_t index;
+		if (path.compare (0, 10, "/dev/rdisk") == 0)
+			index = 10;
+		else if (path.compare (0, 9, "/dev/disk") == 0)
+			index = 9;
+		else
+			return false;
+
+		size_t digitsStart = index;
+		while (index < path.size() && path[index] >= '0' && path[index] <= '9')
+			++index;
+		if (index == digitsStart)
+			return false;
+
+		if (index == path.size())
+			return true;
+
+		if (path[index++] != 's')
+			return false;
+
+		size_t sliceStart = index;
+		while (index < path.size() && path[index] >= '0' && path[index] <= '9')
+			++index;
+
+		return index > sliceStart && index == path.size();
+	}
+
 	void CoreMacOSX::CheckFilesystem (shared_ptr <VolumeInfo> mountedVolume, bool repair) const
 	{
+		// Honor the check-vs-repair distinction by running diskutil on the VeraCrypt
+		// virtual device (diskutil unmounts the inner filesystem itself as needed).
+		// The Core layer has no GUI, so results are shown in a Terminal window via a
+		// temporary .command script. Falls back to launching Disk Utility.app.
+		if (mountedVolume && !mountedVolume->VirtualDevice.IsEmpty())
+		{
+			const string device = mountedVolume->VirtualDevice;
+
+			if (IsPlainDiskDevicePath (device))
+			{
+				try
+				{
+					const string verb = repair ? "repairVolume" : "verifyVolume";
+
+					stringstream scriptPath;
+					scriptPath << "/tmp/VeraCrypt-fsck-" << getpid() << ".command";
+
+					{
+						ofstream script (scriptPath.str().c_str(), ios::out | ios::trunc);
+						if (!script)
+							throw ParameterIncorrect (SRC_POS);
+
+						script << "#!/bin/sh\n"
+							<< "/usr/sbin/diskutil " << verb << " '" << device << "'\n"
+							<< "status=$?\n"
+							<< "echo\n"
+							<< "echo 'Press Enter to close this window.'\n"
+							<< "read dummy\n"
+							<< "rm -f \"$0\"\n"
+							<< "exit $status\n";
+					}
+
+					if (chmod (scriptPath.str().c_str(), 0700) != 0)
+						throw ParameterIncorrect (SRC_POS);
+
+					list <string> openArgs;
+					openArgs.push_back (scriptPath.str());
+					Process::Execute ("/usr/bin/open", openArgs);
+					return;
+				}
+				catch (...)
+				{
+					// Fall back to Disk Utility below.
+				}
+			}
+		}
+
 		list <string> args;
 		struct stat sb;
 
@@ -473,7 +563,7 @@ namespace VeraCrypt
 
 		DevicePath virtualDev;
 		DirectoryPath mountPoint;
-		if (!ExtractDiskImageDeviceAndMountPoint (xml, 0, string::npos, virtualDev, mountPoint)
+		if (!ExtractDiskImageDeviceAndMountPoint (xml, virtualDev, mountPoint)
 			|| virtualDev.IsEmpty())
 			throw ParameterIncorrect (SRC_POS);
 		(void) mountPoint;
