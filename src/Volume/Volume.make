@@ -95,6 +95,15 @@ else
 	OBJS += ../Crypto/Aescrypt.o
 endif
 
+# The blake2s SSE41/SSSE3, SHA-NI and Argon2 AVX2 objects are x86-only and are
+# compiled with x86 SIMD flags (-mssse3/-msse4.1/-msha/-mavx2). In a single-arch
+# arm64 build (LOCAL_DEVELOPMENT_BUILD on Apple Silicon) clang rejects those flags
+# for the lone arm64 target, so they must be skipped here. The universal build
+# keeps them (the flags are absorbed by the x86_64 slice). The runtime dispatch in
+# blake2s.c / Sha2.c / Argon2 falls back to the portable / ARMv8 implementations.
+ifeq "$(LOCAL_DEVELOPMENT_BUILD):$(CPU_ARCH)" "true:arm64"
+	# x86 SIMD objects intentionally omitted on single-arch arm64
+else
 ifeq "$(GCC_GTEQ_430)" "1"
 	OBJSSSE41 += ../Crypto/blake2s_SSE41.osse41
 	OBJSSSSE3 += ../Crypto/blake2s_SSSE3.ossse3
@@ -111,6 +120,7 @@ ifeq "$(GCC_GTEQ_470)" "1"
 	OBJSAVX2 += ../Crypto/Argon2/src/opt_avx2.oavx2
 else
 	OBJS += ../Crypto/Argon2/src/opt_avx2.o
+endif
 endif
 else
 OBJS += ../Crypto/wolfCrypt.o
