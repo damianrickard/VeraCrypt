@@ -685,26 +685,10 @@ namespace VeraCrypt
 		args.push_back ("nobrowse");
 
 #ifdef VC_MACOSX_FUSET
-		// FUSE-T's SMB backend would avoid an NFS/macOS "Network Volumes" privacy
-		// interaction, but FUSE-T 1.0.44 ships only the NFS backend (go-nfsv4) --
-		// there is no SMB backend binary -- so forcing backend=smb makes the mount
-		// helper hang and FuseService::Mount() times out. Only request the SMB
-		// backend when it is actually installed; otherwise fall back to the default
-		// NFS backend, which works.
-		bool smbBackendAvailable = false;
-		try
-		{
-			smbBackendAvailable = (FilesystemPath ("/Library/Application Support/fuse-t/bin/go-smb2").GetType() == FilesystemPathType::File);
-		}
-		catch (...)
-		{
-			// GetType() throws when the path does not exist; treat as unavailable.
-		}
-		if (smbBackendAvailable)
-		{
-			args.push_back ("-o");
-			args.push_back ("backend=smb");
-		}
+		// Use FUSE-T's SMB backend for the auxiliary mount. The default NFS
+		// backend can be affected by macOS Network Volumes privacy state.
+		args.push_back ("-o");
+		args.push_back ("backend=smb");
 		args.push_back ("-o");
 		args.push_back ("nonamedattr");
 		args.push_back ("-o");
