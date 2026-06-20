@@ -11,7 +11,10 @@
 */
 
 #include <fstream>
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <vector>
 #include <CoreFoundation/CoreFoundation.h>
@@ -429,29 +432,83 @@ namespace VeraCrypt
 				{
 					const string verb = repair ? "repairVolume" : "verifyVolume";
 
-					stringstream scriptPath;
-					scriptPath << "/tmp/VeraCrypt-fsck-" << getpid() << ".command";
-
+					// Create the script securely: a predictable name in the
+					// world-writable /tmp invites a symlink/race attack (the file is
+					// later executed, and this path can run elevated). Use the
+					// per-user temp directory (owned, 0700) and mkstemps(), which
+					// creates the file atomically with O_EXCL while keeping the
+					// ".command" suffix that makes /usr/bin/open launch Terminal.
+					string tempDir;
 					{
-						ofstream script (scriptPath.str().c_str(), ios::out | ios::trunc);
-						if (!script)
-							throw ParameterIncorrect (SRC_POS);
-
-						script << "#!/bin/sh\n"
-							<< "/usr/sbin/diskutil " << verb << " '" << device << "'\n"
-							<< "status=$?\n"
-							<< "echo\n"
-							<< "echo 'Press Enter to close this window.'\n"
-							<< "read dummy\n"
-							<< "rm -f \"$0\"\n"
-							<< "exit $status\n";
+						char dirBuf[MAXPATHLEN];
+						size_t n = confstr (_CS_DARWIN_USER_TEMP_DIR, dirBuf, sizeof (dirBuf));
+						if (n > 0 && n <= sizeof (dirBuf))
+							tempDir = dirBuf;
+						else if (const char *t = getenv ("TMPDIR"))
+							tempDir = t;
+						else
+							tempDir = "/tmp/";
 					}
+					if (tempDir.empty() || tempDir[tempDir.size() - 1] != '/')
+						tempDir += '/';
 
-					if (chmod (scriptPath.str().c_str(), 0700) != 0)
+					const char suffix[] = ".command";
+					string templ = tempDir + "VeraCrypt-fsck-XXXXXXXX" + suffix;
+					vector <char> templBuf (templ.begin(), templ.end());
+					templBuf.push_back ('\0');
+
+					int fd = mkstemps (&templBuf[0], static_cast <int> (sizeof (suffix) - 1));
+					if (fd == -1)
 						throw ParameterIncorrect (SRC_POS);
 
+					const string scriptPath (&templBuf[0]);
+
+					try
+					{
+						// Always show diskutil's result (including failures) and
+						// pause; this is why the script captures $? rather than
+						// using "set -e", which would abort before the prompt.
+						const string contents =
+							string ("#!/bin/sh\n")
+							+ "/usr/sbin/diskutil " + verb + " '" + device + "'\n"
+							+ "status=$?\n"
+							+ "echo\n"
+							+ "echo 'Press Enter to close this window.'\n"
+							+ "read dummy\n"
+							+ "rm -f \"$0\"\n"
+							+ "exit $status\n";
+
+						size_t off = 0;
+						while (off < contents.size())
+						{
+							ssize_t written = write (fd, contents.data() + off, contents.size() - off);
+							if (written < 0)
+							{
+								if (errno == EINTR)
+									continue;
+								throw ParameterIncorrect (SRC_POS);
+							}
+							off += static_cast <size_t> (written);
+						}
+
+						// fchmod on the fd (not the path) keeps this race-free.
+						if (fchmod (fd, 0700) != 0)
+							throw ParameterIncorrect (SRC_POS);
+
+						if (close (fd) != 0)	// surfaces deferred write errors
+							throw ParameterIncorrect (SRC_POS);
+						fd = -1;
+					}
+					catch (...)
+					{
+						if (fd != -1)
+							close (fd);
+						unlink (scriptPath.c_str());
+						throw;
+					}
+
 					list <string> openArgs;
-					openArgs.push_back (scriptPath.str());
+					openArgs.push_back (scriptPath);
 					Process::Execute ("/usr/bin/open", openArgs);
 					return;
 				}
