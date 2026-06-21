@@ -16,7 +16,7 @@
 #include <sys/wait.h>
 #include <stdio.h>
 #ifdef TC_MACOSX
-#include <Security/Security.h>
+#include "Core/Unix/MacOSX/PrivilegedHelperClient.h"
 #endif
 #include "Platform/FileStream.h"
 #include "Platform/MemoryStream.h"
@@ -110,13 +110,6 @@ namespace VeraCrypt
 		arguments.push_back (string (request.Device));
 
 		return arguments;
-	}
-
-	static string GetMacOSXAuthorizationErrorMessage (OSStatus status)
-	{
-		stringstream s;
-		s << "Authorization Services returned error " << status;
-		return s.str();
 	}
 #endif
 
@@ -592,33 +585,12 @@ namespace VeraCrypt
 					throw SystemException(SRC_POS, errorMsg);
 			}
 
-			AuthorizationRef authorization = nullptr;
-			AuthorizationItem right = { kAuthorizationRightExecute, static_cast <UInt32> (appPath.size()), (void *) appPath.c_str(), 0 };
-			AuthorizationRights rights = { 1, &right };
-			AuthorizationFlags authFlags = kAuthorizationFlagInteractionAllowed
-				| kAuthorizationFlagExtendRights
-				| kAuthorizationFlagPreAuthorize;
-
-			OSStatus status = AuthorizationCreate (&rights, kAuthorizationEmptyEnvironment, authFlags, &authorization);
-			if (status != errAuthorizationSuccess)
-				throw ElevationFailed (SRC_POS, "AuthorizationCreate", status, GetMacOSXAuthorizationErrorMessage (status));
-
-			FILE *communicationPipe = nullptr;
-			char *args[] = { const_cast <char *> (TC_CORE_SERVICE_CMDLINE_OPTION), nullptr };
-			status = AuthorizationExecuteWithPrivileges (authorization, appPath.c_str(), kAuthorizationFlagDefaults, args, &communicationPipe);
-			AuthorizationFree (authorization, kAuthorizationFlagDefaults);
-
-			if (status != errAuthorizationSuccess)
-				throw ElevationFailed (SRC_POS, "AuthorizationExecuteWithPrivileges", status, GetMacOSXAuthorizationErrorMessage (status));
-
-			if (!communicationPipe)
-				throw ElevationFailed (SRC_POS, "AuthorizationExecuteWithPrivileges", 1, "Authorization Services did not return a communication pipe");
-
-			int pipeFD = fileno (communicationPipe);
-			throw_sys_if (pipeFD == -1);
-
-			int serviceFD = dup (pipeFD);
-			fclose (communicationPipe);
+			// Install (if needed) and drive the SMJobBless privileged helper.
+			// The helper shows the native macOS authentication dialog at install
+			// time, validates this app's code signature on every connection, and
+			// spawns "<appPath> --core-service" as root, returning a connected
+			// socket. VeraCrypt never handles the administrator password.
+			int serviceFD = MacOSXConnectElevatedCoreService (appPath);
 			throw_sys_if (serviceFD == -1);
 
 			shared_ptr <File> servicePipe (new File());
