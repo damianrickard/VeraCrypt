@@ -278,7 +278,7 @@ int main (int /*argc*/, const char * /*argv*/ [])
 	signal (SIGCHLD, SIG_IGN);
 
 	xpc_connection_t listener = xpc_connection_create_mach_service (
-		VC_HELPER_LABEL, dispatch_get_main_queue (), XPC_CONNECTION_MAC_SERVICE_LISTENER);
+		VC_HELPER_LABEL, dispatch_get_main_queue (), XPC_CONNECTION_MACH_SERVICE_LISTENER);
 
 	xpc_connection_set_event_handler (listener, ^(xpc_object_t peerEvent)
 	{

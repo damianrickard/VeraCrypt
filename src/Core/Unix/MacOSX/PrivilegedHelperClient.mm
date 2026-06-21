@@ -15,10 +15,17 @@
 #include "PrivilegedHelperClient.h"
 #include "PrivilegedHelperProtocol.h"
 
+// The Apple framework headers must come first: they typedef BOOL (objc.h),
+// which must be seen before Common/Tcdefs.h redefines BOOL as a macro. They
+// also pull in <mach/error.h>, whose ERR_SUCCESS macro would otherwise mangle
+// the ERR_SUCCESS enumerator in Tcdefs.h, so it is undefined before the
+// VeraCrypt headers (reached via SystemException.h) are included.
 #include <xpc/xpc.h>
 #include <Security/Security.h>
 #include <ServiceManagement/ServiceManagement.h>
 #include <CoreFoundation/CoreFoundation.h>
+
+#undef ERR_SUCCESS
 
 #include "Platform/SystemException.h"
 #include "Core/CoreException.h"
@@ -30,7 +37,7 @@ namespace VeraCrypt
 	static xpc_connection_t ConnectToHelper ()
 	{
 		xpc_connection_t connection = xpc_connection_create_mach_service (
-			VC_HELPER_LABEL, NULL, XPC_CONNECTION_MAC_SERVICE_PRIVILEGED);
+			VC_HELPER_LABEL, NULL, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED);
 
 		if (!connection)
 			throw ElevationFailed (SRC_POS, VC_HELPER_LABEL, 1, "xpc_connection_create_mach_service failed");

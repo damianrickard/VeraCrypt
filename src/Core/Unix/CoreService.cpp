@@ -453,8 +453,19 @@ namespace VeraCrypt
 				//	Test if the user has an active "sudo" session.
 				bool authCheckDone = false;
 #ifdef TC_MACOSX
+				// macOS: establish the privileged channel here, in the main
+				// application process. StartElevated() uses the SMJobBless helper
+				// and XPC, which cannot run in the unprivileged core service (a
+				// fork()ed child that never calls exec()); delegating elevation to
+				// it fails before the native authentication dialog is even shown.
+				// StartElevated() repoints the Service streams at the root core
+				// service, so the request is then sent below like any other.
 				authCheckDone = true;
 				request.FastElevation = false;
+				StartElevated (request);
+				ElevatedServiceAvailable = true;
+				request.Serialize (ServiceInputStream);
+				return GetResponse <T> ();
 #else
 				if (!Core->GetUseDummySudoPassword ())
 				{	
