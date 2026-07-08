@@ -41,6 +41,14 @@ namespace VeraCrypt
 		Serializer sr (stream);
 		uint64 passwordSize;
 		sr.Deserialize ("PasswordSize", passwordSize);
+
+		// Reject a password length that exceeds the fixed buffer capacity before
+		// it is used as the effective password size (mirrors the check in Set()).
+		// Without this a malformed serialized stream could report a size larger
+		// than PasswordBuffer, causing later readers to over-read past its end.
+		if (passwordSize > MaxSize)
+			throw PasswordTooLong (SRC_POS);
+
 		PasswordSize = static_cast <size_t> (passwordSize);
 		sr.Deserialize ("PasswordBuffer", BufferPtr (PasswordBuffer));
 

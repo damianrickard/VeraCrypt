@@ -17,6 +17,15 @@
 
 namespace VeraCrypt
 {
+	// Upper bounds applied when deserializing variable-length data whose size is
+	// read from the (potentially untrusted) stream. They keep a malformed or
+	// hostile serialized message from requesting a huge allocation or driving an
+	// out-of-bounds copy. The limits are far above any legitimate value: the
+	// strings and lists exchanged here are short (field names, paths, mount
+	// options, device names), while bulk data uses the fixed-size BufferPtr path.
+	static const uint64 SerializerMaxStringSize = 0x1000000ULL;      // 16 MiB
+	static const uint64 SerializerMaxCollectionCount = 0x100000ULL;  // 1,048,576 items
+
 	template <typename T>
 	T Serializer::Deserialize ()
 	{
@@ -126,6 +135,11 @@ namespace VeraCrypt
 	{
 		uint64 size = Deserialize <uint64> ();
 
+		// A serialized string always includes a terminating null (size >= 1);
+		// size == 0 is malformed and would make &data[0] undefined behaviour.
+		if (size == 0 || size > SerializerMaxStringSize)
+			throw ParameterIncorrect (SRC_POS);
+
 		vector <char> data ((size_t) size);
 		DataStream->ReadCompleteBuffer (BufferPtr ((uint8 *) &data[0], (size_t) size));
 
@@ -144,7 +158,10 @@ namespace VeraCrypt
 		list <string> deserializedList;
 		uint64 listSize = Deserialize <uint64> ();
 
-		for (size_t i = 0; i < listSize; i++)
+		if (listSize > SerializerMaxCollectionCount)
+			throw ParameterIncorrect (SRC_POS);
+
+		for (uint64 i = 0; i < listSize; i++)
 			deserializedList.push_back (DeserializeString ());
 
 		return deserializedList;
@@ -153,6 +170,14 @@ namespace VeraCrypt
 	wstring Serializer::DeserializeWString ()
 	{
 		uint64 size = Deserialize <uint64> ();
+
+		// A serialized wstring is (length + 1) * sizeof(wchar_t) bytes, so its
+		// size is a non-zero multiple of sizeof(wchar_t). Enforcing that closes
+		// an overflow: the buffer holds (size / sizeof(wchar_t)) elements, but
+		// ReadCompleteBuffer writes 'size' bytes, so a size that is not a
+		// multiple of sizeof(wchar_t) would write past the allocation.
+		if (size == 0 || size > SerializerMaxStringSize || (size % sizeof (wchar_t)) != 0)
+			throw ParameterIncorrect (SRC_POS);
 
 		vector <wchar_t> data ((size_t) size / sizeof (wchar_t));
 		DataStream->ReadCompleteBuffer (BufferPtr ((uint8 *) &data[0], (size_t) size));
@@ -166,7 +191,10 @@ namespace VeraCrypt
 		list <wstring> deserializedList;
 		uint64 listSize = Deserialize <uint64> ();
 
-		for (size_t i = 0; i < listSize; i++)
+		if (listSize > SerializerMaxCollectionCount)
+			throw ParameterIncorrect (SRC_POS);
+
+		for (uint64 i = 0; i < listSize; i++)
 			deserializedList.push_back (DeserializeWString ());
 
 		return deserializedList;
